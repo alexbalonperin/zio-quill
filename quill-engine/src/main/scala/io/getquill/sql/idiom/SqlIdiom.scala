@@ -15,7 +15,7 @@ import io.getquill.norm.ConcatBehavior.AnsiConcat
 import io.getquill.norm.EqualityBehavior.AnsiEquality
 import io.getquill.norm.{ ConcatBehavior, EqualityBehavior, ExpandReturning, NormalizeCaching, ProductAggregationToken }
 import io.getquill.quat.Quat
-import io.getquill.sql.norm.{ RemoveExtraAlias, RemoveUnusedSelects }
+import io.getquill.sql.norm.{ NormalizeFilteredActionAliases, RemoveExtraAlias, RemoveUnusedSelects }
 import io.getquill.util.{ Interleave, Messages }
 import io.getquill.util.Messages.{ fail, trace }
 
@@ -36,6 +36,7 @@ trait SqlIdiom extends Idiom {
     SqlNormalize(ast, concatBehavior, equalityBehavior)
 
   def querifyAst(ast: Ast) = SqlQuery(ast)
+  def querifyAction(ast: Action) = NormalizeFilteredActionAliases(ast)
 
   private def doTranslate(ast: Ast, cached: Boolean, topLevelQuat: Quat, executionType: ExecutionType)(implicit naming: NamingStrategy): (Ast, Statement, ExecutionType) = {
 
@@ -62,6 +63,12 @@ trait SqlIdiom extends Idiom {
           val tokenized = cleaned.token
           trace("tokenized sql")(tokenized)
           tokenized
+        case a: Action =>
+          // Mostly we don't use the alias in SQL set-queries but if we do, make sure they are right
+          val sql = querifyAction(a)
+          trace("action sql")(sql)
+          // Run the tokenization, make sure that we're running tokenization from the top-level (i.e. from the Ast-tokenizer, don't go directly to the action tokenizer)
+          (sql: Ast).token
         case other =>
           other.token
       }
@@ -481,8 +488,13 @@ trait SqlIdiom extends Idiom {
     Tokenizer[ExternalIdent](e => tokenizeIdentName(strategy, e.name).token)
 
   implicit def assignmentTokenizer(implicit astTokenizer: Tokenizer[Ast], strategy: NamingStrategy): Tokenizer[Assignment] = Tokenizer[Assignment] {
-    case Assignment(alias, prop, value) =>
-      stmt"${prop.token} = ${scopedTokenizer(value)}"
+    case a @ Assignment(alias, prop, value) =>
+      // Typically we can't use aliases in the SET clause i.e. `UPDATE Person p SET p.name = 'Joe'` doesn't work, it needs to be SET name = 'Joe'`.
+      // Strangely, MySQL is the only thing that seems to support this aliasing feature but it is not needed.
+      prop match {
+        case Property(_, key) => stmt"${key.token} = ${scopedTokenizer(value)}"
+        case _                => fail(s"Invalid assignment value of ${a}. Must be a Property object.")
+      }
   }
 
   implicit def assignmentDualTokenizer(implicit astTokenizer: Tokenizer[Ast], strategy: NamingStrategy): Tokenizer[AssignmentDual] = Tokenizer[AssignmentDual] {
@@ -503,6 +515,7 @@ trait SqlIdiom extends Idiom {
       case Property(Property.Opinionated(_, name, renameable, _), "isEmpty") => stmt"${renameable.fixedOr(name)(tokenizeColumn(strategy, name, renameable)).token} IS NULL"
       case Property(Property.Opinionated(_, name, renameable, _), "isDefined") => stmt"${renameable.fixedOr(name)(tokenizeColumn(strategy, name, renameable)).token} IS NOT NULL"
       case Property(Property.Opinionated(_, name, renameable, _), "nonEmpty") => stmt"${renameable.fixedOr(name)(tokenizeColumn(strategy, name, renameable)).token} IS NOT NULL"
+      // Used for properties in onConflict etc...
       case Property.Opinionated(_, name, renameable, _) => renameable.fixedOr(name.token)(tokenizeColumn(strategy, name, renameable).token)
     }
 
@@ -522,18 +535,15 @@ trait SqlIdiom extends Idiom {
   protected def actionTokenizer(insertEntityTokenizer: Tokenizer[Entity])(implicit astTokenizer: Tokenizer[Ast], strategy: NamingStrategy): Tokenizer[Action] =
     Tokenizer[Action] {
 
+      case action @ Update(Filter(_: Entity, alias, _), _) => SqlIdiom.withActionAlias(this, action, alias)
+      case action @ Delete(Filter(_: Entity, alias, _))    => SqlIdiom.withActionAlias(this, action, alias)
+
       case Insert(entity: Entity, assignments) =>
         val (table, columns, values) = insertInfo(insertEntityTokenizer, entity, assignments)
-        stmt"INSERT $table${actionAlias.map(alias => stmt" AS ${alias.token}").getOrElse(stmt"")} (${columns.mkStmt(",")}) VALUES (${values.map(scopedTokenizer(_)).mkStmt(", ")})"
+        stmt"INSERT $table${actionAlias.map(alias => stmt" AS ${alias.token}").getOrElse(stmt"")} (${columns.mkStmt(",")}) VALUES (${values.mkStmt(", ")})"
 
       case Update(table: Entity, assignments) =>
         stmt"UPDATE ${table.token}${actionAlias.map(alias => stmt" AS ${alias.token}").getOrElse(stmt"")} SET ${assignments.token}"
-
-      case Update(Filter(table: Entity, x, where), assignments) =>
-        stmt"UPDATE ${table.token}${actionAlias.map(alias => stmt" AS ${alias.token}").getOrElse(stmt"")} SET ${assignments.token} WHERE ${where.token}"
-
-      case Delete(Filter(table: Entity, x, where)) =>
-        stmt"DELETE FROM ${table.token}${actionAlias.map(alias => stmt" AS ${alias.token}").getOrElse(stmt"")} WHERE ${where.token}"
 
       case Delete(table: Entity) =>
         stmt"DELETE FROM ${table.token}${actionAlias.map(alias => stmt" AS ${alias.token}").getOrElse(stmt"")}"
@@ -563,7 +573,7 @@ trait SqlIdiom extends Idiom {
           case OutputClauseSupported => action match {
             case Insert(entity: Entity, assignments) =>
               val (table, columns, values) = insertInfo(insertEntityTokenizer, entity, assignments)
-              stmt"INSERT $table${actionAlias.map(alias => stmt" AS ${alias.token}").getOrElse(stmt"")} (${columns.mkStmt(",")}) OUTPUT ${returnListTokenizer.token(ExpandReturning(r, Some("INSERTED"))(this, strategy).map(_._1))} VALUES (${values.map(scopedTokenizer(_)).mkStmt(", ")})"
+              stmt"INSERT $table${actionAlias.map(alias => stmt" AS ${alias.token}").getOrElse(stmt"")} (${columns.mkStmt(",")}) OUTPUT ${returnListTokenizer.token(ExpandReturning(r, Some("INSERTED"))(this, strategy).map(_._1))} VALUES (${values.mkStmt(", ")})"
             case Update(_, _) =>
               stmt"${action.token} OUTPUT ${returnListTokenizer.token(ExpandReturning(r, Some("INSERTED"))(this, strategy).map(_._1))}"
             case Delete(_) =>
@@ -581,8 +591,13 @@ trait SqlIdiom extends Idiom {
 
   private def insertInfo(insertEntityTokenizer: Tokenizer[Entity], entity: Entity, assignments: List[Assignment])(implicit astTokenizer: Tokenizer[Ast]) = {
     val table = insertEntityTokenizer.token(entity)
-    val columns = assignments.map(_.property.token)
-    val values = assignments.map(_.value)
+    val columns =
+      assignments.map(assignment =>
+        assignment.property match {
+          case Property(_, key) => key.token
+          case _                => fail(s"Invalid assignment value of ${assignment}. Must be a Property object.")
+        })
+    val values = assignments.map(_.value.token)
     (table, columns, values)
   }
 
@@ -613,6 +628,25 @@ object SqlIdiom {
       override def idiomReturningCapability: ReturningCapability = parent.idiomReturningCapability
       override def productAggregationToken: ProductAggregationToken = parent.productAggregationToken
     }
+
+  private[getquill] def withActionAlias(parentIdiom: SqlIdiom, action: Action, alias: Ident)(implicit strategy: NamingStrategy) = {
+    val idiom = copyIdiom(parentIdiom, Some(alias))
+    import idiom._
+
+    implicit val stableTokenizer = idiom.astTokenizer(new Tokenizer[Ast] {
+      override def token(v: Ast): Token = astTokenizer(this, strategy).token(v)
+    }, strategy)
+
+    action match {
+      case Update(Filter(table: Entity, x, where), assignments) =>
+        // Uses the `alias` passed in as `actionAlias` since that is now assigned to the copied SqlIdiom
+        stmt"UPDATE ${table.token}${actionAlias.map(alias => stmt" AS ${alias.token}").getOrElse(stmt"")} SET ${assignments.token} WHERE ${where.token}"
+      case Delete(Filter(table: Entity, x, where)) =>
+        stmt"DELETE FROM ${table.token}${actionAlias.map(alias => stmt" AS ${alias.token}").getOrElse(stmt"")} WHERE ${where.token}"
+      case _ =>
+        fail("Invalid state. Only UPDATE/DELETE with filter allowed here.")
+    }
+  }
 
   /**
    * Construct a new instance of the specified idiom with `newActionAlias` variable specified so that actions
